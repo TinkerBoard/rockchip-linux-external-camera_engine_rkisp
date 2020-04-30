@@ -153,6 +153,7 @@ class CamIA10Engine: public CamIA10EngineItf {
   RESULT runManIspForPreIsp(struct CamIA10_Results* result);
   RESULT runManIspForOTP(struct CamIA10_Results* result);
   RESULT runManIspForFlash(struct CamIA10_Results* result);
+  AecEcmFlickerPeriod_t readAntibandingMode();
   const char* mSensorEntityName;
   int mIspVer;
   int mXMLIspOutputType;
