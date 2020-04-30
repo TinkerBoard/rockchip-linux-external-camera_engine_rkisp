@@ -4,6 +4,7 @@
 #include <ebase/utl_fixfloat.h>
 #include <calib_xml/calibdb.h>
 #include <base/xcam_log.h>
+#include <sys/stat.h>
 
 #include "cam_ia10_engine.h"
 #include "cam_ia10_engine_isp_modules.h"
@@ -64,6 +65,37 @@ CamIA10Engine::~CamIA10Engine() {
     //LOGD("%s: E", __func__);
     deinit();
     //LOGD("%s: x", __func__);
+}
+
+AecEcmFlickerPeriod_t CamIA10Engine::readAntibandingMode() {
+    FILE *input_file;
+    struct stat st;
+    char *file_path = "/tmp/flicker_mode";
+    char *buffer;
+    long size;
+    AecEcmFlickerPeriod_t result = AEC_EXPOSURE_CONVERSION_FLICKER_OFF;
+
+    if (stat(file_path, &st) == 0) {
+        size = st.st_size;
+    } else {
+        LOGE("@%s %d: Fail to read size of %s", __FUNCTION__, __LINE__, file_path);
+        return result;
+    }
+
+    input_file = fopen(file_path, "r+");
+    buffer = (char *)malloc(size * sizeof(char));
+    fread(buffer, size, 1, input_file);
+
+    if (strncmp(buffer, "50", 2) == 0)
+        result = AEC_EXPOSURE_CONVERSION_FLICKER_100HZ;
+    if (strncmp(buffer, "60", 2) == 0)
+        result = AEC_EXPOSURE_CONVERSION_FLICKER_120HZ;
+
+    LOGD("@%s %d: result %d", __FUNCTION__, __LINE__, result);
+
+    free(buffer);
+    fclose(input_file);
+    return result;
 }
 
 RESULT CamIA10Engine::restart() {
@@ -545,6 +577,9 @@ RESULT CamIA10Engine::updateAeConfig(struct CamIA10_DyCfg* cfg) {
             aecCfg.EcmFlickerSelect = AEC_EXPOSURE_CONVERSION_FLICKER_120HZ;
         else
             aecCfg.EcmFlickerSelect = AEC_EXPOSURE_CONVERSION_FLICKER_100HZ;
+
+        AecEcmFlickerPeriod_t antiMode = readAntibandingMode();
+        if(antiMode != aecCfg.EcmFlickerSelect) aecCfg.EcmFlickerSelect = antiMode;
 
         if (set->meter_mode == HAL_AE_METERING_MODE_CENTER) {
 #if 0
