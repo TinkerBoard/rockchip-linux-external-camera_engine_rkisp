@@ -26,11 +26,19 @@
 #define DEFAULT_FCC             V4L2_PIX_FMT_NV12
 #define DEFAULT_BUFFER_COUNT    4
 
+#define IS_BAYER_RAW(mbus_code) ((mbus_code) >= MEDIA_BUS_FMT_SBGGR8_1X8 && \
+                                 (mbus_code) < MEDIA_BUS_FMT_JPEG_1X8)
+
 static int silent;
 
 #define DBG(str, ...) do { if(!silent) printf("[DBG]%s:%d: " str, __func__, __LINE__, __VA_ARGS__); } while(0)
 #define INFO(str, ...) do { printf("[INFO]%s:%d: " str, __func__, __LINE__, __VA_ARGS__); } while (0)
+#define WARN(str, ...) do { printf("[WARN]%s:%d: " str, __func__, __LINE__, __VA_ARGS__); } while (0)
 #define ERR(str, ...) do { fprintf(stderr, "[ERR]%s:%d: " str, __func__, __LINE__, __VA_ARGS__); } while (0)
+
+#define FCC_TO_CHARS(fcc) \
+            ((fcc) >> 0) & 0xFF, ((fcc) >> 8) & 0xFF, \
+            ((fcc) >> 16) & 0xFF, ((fcc) >> 24) & 0xFF
 
 struct rkisp_buf_priv {
     struct rkisp_api_buf pul;
@@ -55,6 +63,12 @@ struct control_params_3A
     XCam::Mutex _meta_mutex;
 };
 
+enum {
+    CAM_TYPE_RKISP1,
+    CAM_TYPE_RKCIF,
+    CAM_TYPE_USB,
+};
+
 struct rkisp_priv {
     struct rkisp_api_ctx ctx;
 
@@ -72,10 +86,11 @@ struct rkisp_priv {
 
     struct rkisp_buf_priv *bufs;
 
-    int is_rkcif;
+    int camera_type;
 
     void* rkisp_engine;
     struct rkisp_media_info media_info;
+    char mdev_path[64];
     camera_metadata_t* meta;
     struct control_params_3A* g_3A_control_params;
 };
@@ -89,6 +104,10 @@ static int rkisp_start_engine(struct rkisp_priv *priv);
 static int rkisp_get_ae_time(struct rkisp_priv *priv, int64_t &time);
 static int rkisp_get_ae_gain(struct rkisp_priv *priv, int &gain);
 static int rkisp_get_meta_frame_id(struct rkisp_priv *priv, int64_t& frame_id);
+static int rkisp_get_luminance_grid(struct rkisp_priv *, unsigned char *, int);
+static int rkisp_get_histogram(struct rkisp_priv *, int *, int);
+
+static int rkisp_get_fmt(const struct rkisp_api_ctx *ctx);
 
 static int xioctl(int fh, int request, void *arg)
 {
@@ -108,12 +127,21 @@ static int rkisp_qbuf(struct rkisp_priv *priv, int buf_index)
     buf.type = priv->buf_type;
     buf.memory = priv->memory;
     buf.index = buf_index;
-    buf.m.planes = planes;
-    buf.length = FMT_NUM_PLANES;
 
-    if (priv->memory == V4L2_MEMORY_DMABUF) {
-        planes[0].m.fd = priv->dmabuf_fds[buf_index];
-        planes[0].length = priv->buf_length;
+    if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == priv->buf_type) {
+        struct v4l2_plane planes[FMT_NUM_PLANES];
+        buf.m.planes = planes;
+        buf.length = FMT_NUM_PLANES;
+
+        if (priv->memory == V4L2_MEMORY_DMABUF) {
+            planes[0].m.fd = priv->dmabuf_fds[buf_index];
+            planes[0].length = priv->buf_length;
+        }
+    } else {
+        if (priv->memory == V4L2_MEMORY_DMABUF) {
+            buf.m.fd = priv->dmabuf_fds[buf_index];
+            buf.length = priv->buf_length;
+        }
     }
 
     if (-1 == xioctl(priv->ctx.fd, VIDIOC_QBUF, &buf)) {
@@ -172,19 +200,26 @@ rkisp_init_dmabuf(struct rkisp_priv *priv)
     }
 
     CLEAR(buf);
-    CLEAR(planes[0]);
     buf.type = priv->buf_type;
     buf.index = 0;
-    buf.m.planes = planes;
-    buf.length = FMT_NUM_PLANES;
+    if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == priv->buf_type) {
+        CLEAR(planes[0]);
+        buf.m.planes = planes;
+        buf.length = FMT_NUM_PLANES;
+    }
 
     if (-1 == xioctl(priv->ctx.fd, VIDIOC_QUERYBUF, &buf)) {
         ERR("ERR QUERYBUF: %d\n", errno);
         return -1;
     }
-    if (planes[0].length > priv->req_buf_length) {
-        ERR("ERR DMABUF size if smaller than desired, %d < %d\n",
-            priv->req_buf_length, planes[0].length);
+    if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == priv->buf_type)
+        priv->buf_length = planes[0].length;
+    else
+        priv->buf_length = buf.length;
+
+    if (priv->buf_length > priv->req_buf_length) {
+        ERR("ERR DMABUF size is smaller than desired, %d < %d\n",
+            priv->req_buf_length, priv->buf_length);
         return -1;
     }
     priv->buf_length = priv->req_buf_length;
@@ -251,6 +286,7 @@ static int rkisp_init_mmap(struct rkisp_priv *priv)
     for (i = 0; i < req.count; i++) {
         struct v4l2_plane planes[FMT_NUM_PLANES];
         struct v4l2_buffer buf;
+        int offset;
 
         CLEAR(buf);
         CLEAR(planes);
@@ -258,19 +294,27 @@ static int rkisp_init_mmap(struct rkisp_priv *priv)
         buf.type = priv->buf_type;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = i;
-        buf.m.planes = planes;
-        buf.length = FMT_NUM_PLANES;
+        if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == priv->buf_type) {
+            buf.m.planes = planes;
+            buf.length = FMT_NUM_PLANES;
+        }
 
         if (xioctl(priv->ctx.fd, VIDIOC_QUERYBUF, &buf) == -1) {
             ERR("QUERYBUF failed: %d, %s\n", errno, strerror(errno));
             goto unmap;
         }
 
-        priv->buf_length = buf.m.planes[0].length;
-        priv->buf_mmap[i] = mmap(NULL, buf.m.planes[0].length,
-                                 PROT_READ | PROT_WRITE, MAP_SHARED,
-                                 priv->ctx.fd, buf.m.planes[0].m.mem_offset);
+        if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == priv->buf_type) {
+            priv->buf_length = planes[0].length;
+            offset = planes[0].m.mem_offset;
+        } else {
+            priv->buf_length = buf.length;
+            offset = buf.m.offset;
+        }
 
+        priv->buf_mmap[i] = mmap(NULL, priv->buf_length,
+                                 PROT_READ | PROT_WRITE, MAP_SHARED,
+                                 priv->ctx.fd, offset);
         if (MAP_FAILED == priv->buf_mmap[i]) {
             ERR("Mmap failed, %d, %s\n", errno, strerror(errno));
             goto unmap;
@@ -336,7 +380,11 @@ rkisp_open_device(const char *dev_path, int uselocal3A)
         goto err_close;
     }
 
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)) {
+    if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
+        priv->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    } else if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
+        priv->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    } else {
         ERR("%s is not a video capture device, capabilities: %x\n",
             dev_path, cap.capabilities);
         goto err_close;
@@ -347,14 +395,13 @@ rkisp_open_device(const char *dev_path, int uselocal3A)
         goto err_close;
     }
 
-    priv->buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     strncpy(priv->ctx.dev_path, dev_path, sizeof(priv->ctx.dev_path));
 
     if (rkisp_get_media_topology(priv))
         goto err_close;
 
     if (uselocal3A) {
-        if (priv->is_rkcif) {
+        if (priv->camera_type != CAM_TYPE_RKISP1) {
             ERR("rkcif(%s) is not supports local 3A\n", dev_path);
             goto err_close;
         }
@@ -367,8 +414,7 @@ rkisp_open_device(const char *dev_path, int uselocal3A)
             goto err_close;
     }
 
-    rkisp_set_fmt((struct rkisp_api_ctx*) priv,
-                  DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FCC);
+    rkisp_get_fmt((struct rkisp_api_ctx*) priv);
 
     /* Set default value in case app does not call #{rkisp_set_buf()} */
     priv->req_buf_count = DEFAULT_BUFFER_COUNT;
@@ -443,6 +489,29 @@ static int rkisp_init_buf(struct rkisp_priv *priv)
     return 0;
 }
 
+static int rkisp_get_fmt(const struct rkisp_api_ctx *ctx)
+{
+    struct rkisp_priv *priv = (struct rkisp_priv *) ctx;
+    struct v4l2_format fmt;
+
+    CLEAR(fmt);
+    fmt.type = priv->buf_type;
+    if (-1 == xioctl(priv->ctx.fd, VIDIOC_G_FMT, &fmt)) {
+        ERR("%s ERR S_FMT: %d, %s\n", priv->ctx.dev_path,
+	    errno, strerror(errno));
+        return -errno;
+    }
+
+    priv->ctx.width = fmt.fmt.pix.width;
+    priv->ctx.height = fmt.fmt.pix.height;
+    priv->ctx.fcc = fmt.fmt.pix.pixelformat;
+
+    INFO("Get Driver default fmt: fcc %C%C%C%C [%dx%d]\n",
+         FCC_TO_CHARS(priv->ctx.fcc), priv->ctx.width, priv->ctx.height);
+
+    return 0;
+}
+
 int
 rkisp_set_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int fcc)
 {
@@ -467,7 +536,7 @@ rkisp_set_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int fcc)
     if (-1 == xioctl(priv->ctx.fd, VIDIOC_S_FMT, &fmt)) {
         ERR("%s ERR S_FMT: %d, %s\n", priv->ctx.dev_path,
 	    errno, strerror(errno));
-        return -1;
+        return -errno;
     }
 
     priv->ctx.width = fmt.fmt.pix.width;
@@ -475,10 +544,9 @@ rkisp_set_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int fcc)
     priv->ctx.fcc = fmt.fmt.pix.pixelformat;
 
     if (priv->ctx.width != w || priv->ctx.height != h || priv->ctx.fcc != fcc)
-        INFO("Format is not match, request: fcc 0x%08x [%dx%d], "
-             "driver supports: fcc 0x%08x [%dx%d]\n",
-             fcc, w, h,
-             priv->ctx.fcc, priv->ctx.width, priv->ctx.height);
+        WARN("Format is not match, request: fcc %C%C%C%C [%dx%d], "
+             "driver supports: fcc %C%C%C%C [%dx%d]\n", FCC_TO_CHARS(fcc), w, h,
+             FCC_TO_CHARS(priv->ctx.fcc), priv->ctx.width, priv->ctx.height);
 
     return 0;
 }
@@ -491,9 +559,12 @@ rkisp_set_sensor_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int code)
     const char *sensor;
     int ret, fd;
 
+    if (priv->camera_type == CAM_TYPE_USB)
+        return -EINVAL;
+
     sensor = rkisp_get_active_sensor(priv);
     if (!sensor)
-        return -1;
+        return -EINVAL;
     fd = open(sensor, O_RDWR | O_CLOEXEC, 0);
     if (fd < 0) {
        ERR("Open sensor subdev %s failed, %s\n", sensor, strerror(errno));
@@ -503,6 +574,12 @@ rkisp_set_sensor_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int code)
     memset(&fmt, 0, sizeof(fmt));
     fmt.pad = 0; //TODO: It's not definite that pad always be 0
     fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    ret = ioctl(fd, VIDIOC_SUBDEV_G_FMT, &fmt);
+    if (ret < 0) {
+        ERR("get sensor fmt failed %s.\n", strerror(errno));
+        goto close;
+    }
+
     fmt.format.height = h;
     fmt.format.width = w;
     fmt.format.code = code;
@@ -520,8 +597,191 @@ rkisp_set_sensor_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int code)
              sensor, fmt.format.width, fmt.format.height, fmt.format.code);
     }
 
+    /* If ispsd input size is larger than sensor, update pipeline with default value */
+    if (priv->camera_type == CAM_TYPE_RKISP1 &&
+        strlen(priv->media_info.sd_isp_path) != 0) {
+        struct v4l2_subdev_format isp_fmt;
+        int isp_fd;
+
+        isp_fd = open(priv->media_info.sd_isp_path, O_RDWR | O_CLOEXEC, 0);
+        if (isp_fd < 0) {
+            ERR("Open isp subdev failed, %s\n", strerror(errno));
+            goto close;
+        }
+
+        memset(&isp_fmt, 0, sizeof(isp_fmt));
+        isp_fmt.pad = 0; //TODO isp sd sink pad always be 0?
+        isp_fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+        ret = ioctl(isp_fd, VIDIOC_SUBDEV_G_FMT, &isp_fmt);
+        if (ret < 0) {
+            ERR("isp subdev get fmt failed %s.\n", strerror(errno));
+            close(isp_fd);
+            goto close;
+        }
+        close(isp_fd);
+
+        if (isp_fmt.format.width > fmt.format.width ||
+            isp_fmt.format.height > fmt.format.height ||
+            isp_fmt.format.code != fmt.format.code) {
+                int ispsd_out_code, width, height;
+
+                WARN("isp subdev fmt(%dx%d) > fmt(%dx%d), or mbus code(0x%08x) != 0x%08x\n",
+                     isp_fmt.format.width, isp_fmt.format.height,
+                     fmt.format.width, fmt.format.height,
+                     isp_fmt.format.code, fmt.format.code);
+                WARN("Update isp pipeline accordeing to sensor settings, "
+                     "PLEASE DOUBLE CHECK with `medai-ctl -p -d %s`\n",
+                     priv->mdev_path);
+                if (IS_BAYER_RAW(fmt.format.code))
+                    ispsd_out_code = MEDIA_BUS_FMT_YUYV8_2X8;
+                else
+                    ispsd_out_code = fmt.format.code;
+
+                width = fmt.format.width;
+                height = fmt.format.height;
+
+                ret = rkisp_set_ispsd_fmt(ctx, width, height, fmt.format.code,
+                                          width, height, ispsd_out_code);
+                if (ret)
+                    goto close;
+        }
+    }
+
 close:
     close(fd);
+    return ret;
+}
+
+int
+rkisp_video_set_crop(const struct rkisp_priv *priv, int x, int y, int w, int h)
+{
+    struct v4l2_selection sel;
+    int ret;
+
+    memset(&sel, 0, sizeof(sel));
+    sel.type = priv->buf_type;
+    sel.r.width = w;
+    sel.r.height = h;
+    sel.r.left = x;
+    sel.r.top = y;
+    sel.target = V4L2_SEL_TGT_CROP;
+    sel.flags = 0;
+    ret = ioctl(priv->ctx.fd, VIDIOC_S_SELECTION, &sel);
+    if (ret) {
+        ERR("set output crop(0,0/%dx%d) failed, %s\n", w, h, strerror(errno));
+        return ret;
+    }
+
+    return 0;
+}
+
+static int
+rkisp_sd_set_crop(const char *ispsd, int fd, int pad, int *w, int *h)
+{
+    struct v4l2_subdev_selection sel;
+    int ret;
+
+    memset(&sel, 0, sizeof(sel));
+    sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    sel.pad = pad;
+    sel.r.width = *w;
+    sel.r.height = *h;
+    sel.r.left = 0;
+    sel.r.top = 0;
+    sel.target = V4L2_SEL_TGT_CROP;
+    sel.flags = V4L2_SEL_FLAG_LE;
+    ret = ioctl(fd, VIDIOC_SUBDEV_S_SELECTION, &sel);
+    if (ret) {
+        ERR("subdev %s pad %d crop failed, ret = %d\n", ispsd, sel.pad, ret);
+        return ret;
+    }
+
+    *w = sel.r.width;
+    *h = sel.r.height;
+
+    return 0;
+}
+
+static int
+rkisp_sd_set_fmt(const char *ispsd, int pad, int *w, int *h, int code)
+{
+    struct v4l2_subdev_format fmt;
+    int ret, fd;
+
+    fd = open(ispsd, O_RDWR | O_CLOEXEC, 0);
+    if (fd < 0) {
+       ERR("Open isp subdev %s failed, %s\n", ispsd, strerror(errno));
+       return fd;
+    }
+
+    if (pad == 2) { /* Source pad */
+        ret = rkisp_sd_set_crop(ispsd, fd, pad, w, h);
+        if (ret)
+            goto close;
+    }
+
+    /* Get fmt and only update what we want */
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.pad = pad;
+    fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    ret = ioctl(fd, VIDIOC_SUBDEV_G_FMT, &fmt);
+    if (ret < 0) {
+        ERR("subdev %s get pad: %d fmt failed %s.\n",
+            ispsd, fmt.pad, strerror(errno));
+        goto close;
+    }
+
+    fmt.format.height = *h;
+    fmt.format.width = *w;
+    fmt.format.code = code;
+
+    ret = ioctl(fd, VIDIOC_SUBDEV_S_FMT, &fmt);
+    if (ret < 0) {
+        ERR("subdev %s set pad: %d fmt failed %s.\n",
+            ispsd, fmt.pad, strerror(errno));
+        goto close;
+    }
+
+    if (fmt.format.width != *w || fmt.format.height != *h ||
+        fmt.format.code != code) {
+        INFO("subdev %s pad %d choose the best fit fmt: %dx%d, 0x%08x\n",
+             ispsd, pad, fmt.format.width, fmt.format.height, fmt.format.code);
+    }
+
+    *w = fmt.format.width;
+    *h = fmt.format.height;
+    if (pad == 0) {
+        ret = rkisp_sd_set_crop(ispsd, fd, pad, w, h);
+        if (ret)
+            goto close;
+    }
+
+close:
+    close(fd);
+
+    return ret;
+}
+
+int
+rkisp_set_ispsd_fmt(const struct rkisp_api_ctx *ctx,
+                    int in_w, int in_h, int in_code,
+                    int out_w, int out_h, int out_code)
+{
+    struct rkisp_priv *priv = (struct rkisp_priv *) ctx;
+    const char *ispsd;
+    int ret;
+
+    if (priv->camera_type != CAM_TYPE_RKISP1)
+        return -EINVAL;
+
+    ispsd = priv->media_info.sd_isp_path;
+    //TODO: check source and sink pad
+    ret = rkisp_sd_set_fmt(ispsd, 0, &in_w, &in_h, in_code);
+    ret |= rkisp_sd_set_fmt(ispsd, 2, &out_w, &out_h, out_code);
+
+    /* set video selection(crop) because ispsd size changed */
+    ret |= rkisp_video_set_crop(priv, 0, 0, out_w, out_h);
+
     return ret;
 }
 
@@ -654,8 +914,10 @@ rkisp_get_frame(const struct rkisp_api_ctx *ctx, int timeout_ms)
     CLEAR(buf);
     buf.type = priv->buf_type;
     buf.memory = priv->memory;
-    buf.m.planes = planes;
-    buf.length = FMT_NUM_PLANES;
+    if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == priv->buf_type) {
+        buf.m.planes = planes;
+        buf.length = FMT_NUM_PLANES;
+    }
 
     if (-1 == xioctl(priv->ctx.fd, VIDIOC_DQBUF, &buf)) {
         ERR("ERR DQBUF: %d\n", errno);
@@ -663,7 +925,10 @@ rkisp_get_frame(const struct rkisp_api_ctx *ctx, int timeout_ms)
     }
 
     buffer = &priv->bufs[buf.index];
-    buffer->pul.size = buf.m.planes[0].bytesused;
+    if (V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE == priv->buf_type)
+        buffer->pul.size = buf.m.planes[0].bytesused;
+    else
+        buffer->pul.size = buf.bytesused;
     buffer->pul.next_plane = NULL;
 
     if (priv->memory == V4L2_MEMORY_DMABUF) {
@@ -681,6 +946,10 @@ rkisp_get_frame(const struct rkisp_api_ctx *ctx, int timeout_ms)
         rkisp_get_ae_time(priv, buffer->pul.metadata.expo_time);
         rkisp_get_ae_gain(priv, buffer->pul.metadata.gain);
         rkisp_get_meta_frame_id(priv, buffer->pul.metadata.frame_id);
+        buffer->pul.metadata.luminance_grid_count = rkisp_get_luminance_grid(priv,
+           buffer->pul.metadata.luminance_grid, RKISP_MAX_LUMINANCE_GRID);
+        buffer->pul.metadata.hist_bins_count = rkisp_get_histogram(priv,
+           buffer->pul.metadata.hist_bins, RKISP_MAX_HISTOGRAM_BIN);
     }
 
     return (struct rkisp_api_buf*)buffer;
@@ -780,7 +1049,7 @@ static int rkisp_get_meta_frame_id(struct rkisp_priv *priv, int64_t& frame_id) {
 
     entry = ctl_params->_result_metadata.find(RKCAMERA3_PRIVATEDATA_EFFECTIVE_DRIVER_FRAME_ID);
     if (!entry.count) {
-        DBG("no RKCAMERA3_PRIVATEDATA_EFFECTIVE_DRIVER_FRAME_ID, %d\n", entry.count);
+        DBG("no RKCAMERA3_PRIVATEDATA_EFFECTIVE_DRIVER_FRAME_ID, %lu\n", entry.count);
         frame_id = -1;
         return -1;
     }
@@ -788,7 +1057,6 @@ static int rkisp_get_meta_frame_id(struct rkisp_priv *priv, int64_t& frame_id) {
 
     return 0;
 }
-
 
 /* time in ns */
 static int rkisp_get_ae_time(struct rkisp_priv *priv, int64_t &time)
@@ -854,6 +1122,52 @@ static int rkisp_getAeMaxExposureGain(struct rkisp_priv *priv, int &gain)
 
     return 0;
 }
+
+static int rkisp_get_histogram(struct rkisp_priv *priv, int *hist, int size)
+{
+    struct control_params_3A* ctl_params = priv->g_3A_control_params;
+    camera_metadata_entry entry, count;
+
+    SmartLock lock(ctl_params->_meta_mutex);
+
+    count = ctl_params->_result_metadata.find(ANDROID_STATISTICS_INFO_MAX_HISTOGRAM_COUNT);
+    entry = ctl_params->_result_metadata.find(ANDROID_STATISTICS_HISTOGRAM);
+    if (!entry.count || !count.count)
+        return -1;
+
+    if (count.data.i32[0] > size) {
+        ERR("size of array [%d] < target size [%d]\n", size, count.data.i32[0]);
+        return -1;
+    }
+
+    memcpy(hist, entry.data.i32, sizeof(int) * count.data.i32[0]);
+
+    return count.data.i32[0];
+}
+
+static int
+rkisp_get_luminance_grid(struct rkisp_priv *priv, unsigned char *luma, int size)
+{
+    struct control_params_3A* ctl_params = priv->g_3A_control_params;
+    camera_metadata_entry entry, count;
+
+    SmartLock lock(ctl_params->_meta_mutex);
+
+    count = ctl_params->_result_metadata.find(RKCAMERA3_PRIVATEDATA_EXP_MEANS_COUNT);
+    entry = ctl_params->_result_metadata.find(RKCAMERA3_PRIVATEDATA_EXP_MEANS);
+    if (!entry.count || !count.count)
+        return -1;
+
+    if (count.data.i32[0] > size) {
+        ERR("size of array [%d] < target size [%d]\n", size, count.data.i32[0]);
+        return -1;
+    }
+
+    memcpy(luma, entry.data.u8, sizeof(entry.data.u8[0]) * count.data.i32[0]);
+
+    return count.data.i32[0];
+}
+
 
 static int init_3A_control_params(struct rkisp_priv *priv)
 {
@@ -945,8 +1259,9 @@ deinit_params:
 
 static int rkisp_start_engine(struct rkisp_priv *priv)
 {
-    rkisp_cl_start(priv->rkisp_engine);
-    if (priv->rkisp_engine == NULL) {
+    int ret;
+    ret = rkisp_cl_start(priv->rkisp_engine);
+    if (ret || priv->rkisp_engine == NULL) {
         ERR("rkisp_init engine failed, engine = %p\n", priv->rkisp_engine);
         return -1;
     }
@@ -1000,22 +1315,29 @@ static int rkisp_get_media_topology(struct rkisp_priv *priv)
         if (!strcmp(priv->media_info.vd_main_path, priv->ctx.dev_path) ||
             !strcmp(priv->media_info.vd_self_path, priv->ctx.dev_path)) {
             INFO("Get rkisp media device: %s info, done\n", mdev_path);
+            priv->camera_type = CAM_TYPE_RKISP1;
             break;
         } else if (!strcmp(priv->media_info.vd_cif_path, priv->ctx.dev_path)) {
             INFO("Get rkcif media device: %s info, done\n", mdev_path);
-            priv->is_rkcif = 1;
+            priv->camera_type = CAM_TYPE_RKCIF;
             break;
         }
     }
 
     if (ret) {
-        ERR("Can not find media topology for %s,"
-            "please check 'media-ctl -p -d /dev/mediaX'\n", priv->ctx.dev_path);
-        return ret;
+        INFO("The %s could be a USB camera.\n", priv->ctx.dev_path);
+        priv->camera_type = CAM_TYPE_USB;
+        priv->mdev_path[0] = '\0';
+        return 0;
     }
 
-    if (!rkisp_get_active_sensor(priv))
+    strcpy(priv->mdev_path, mdev_path);
+
+    if (!rkisp_get_active_sensor(priv)) {
+        ERR("%s is RKISP1 or RKCIF device but not sensor attached\n",
+            priv->ctx.dev_path);
         return -1;
+    }
 
     return ret;
 }
@@ -1027,7 +1349,7 @@ rkisp_set_manual_expo(const struct rkisp_api_ctx *ctx, int on)
     struct control_params_3A* ctl_params;
     uint8_t ae_mode;
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
 
     ctl_params = priv->g_3A_control_params;
@@ -1069,7 +1391,7 @@ rkisp_update_expo(const struct rkisp_api_ctx *ctx, int gain, int64_t expo_time_n
     uint8_t ae_mode = ANDROID_CONTROL_AE_MODE_OFF;
     int32_t sensitivity = gain;
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
 
     ctl_params = priv->g_3A_control_params;
@@ -1093,7 +1415,7 @@ rkisp_set_max_expotime(const struct rkisp_api_ctx *ctx, int64_t max_expo_time_ns
     struct control_params_3A* ctl_params;
     int64_t exptime_range_ns[2] = {0};
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
 
     ctl_params = priv->g_3A_control_params;
@@ -1118,7 +1440,7 @@ rkisp_get_max_expotime(const struct rkisp_api_ctx *ctx, int64_t *max_expo_time)
     struct control_params_3A* ctl_params;
     camera_metadata_entry entry;
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
 
     SmartLock lock(ctl_params->_meta_mutex);
@@ -1139,7 +1461,7 @@ rkisp_set_max_gain(const struct rkisp_api_ctx *ctx, int max_gain)
     struct control_params_3A* ctl_params;
     int32_t sensitivity_range[2] = {0,0};
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
 
     ctl_params = priv->g_3A_control_params;
@@ -1165,7 +1487,7 @@ rkisp_get_max_gain(const struct rkisp_api_ctx *ctx, int *max_gain)
     struct control_params_3A* ctl_params;
     camera_metadata_entry entry;
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
 
     SmartLock lock(ctl_params->_meta_mutex);
@@ -1180,13 +1502,41 @@ rkisp_get_max_gain(const struct rkisp_api_ctx *ctx, int *max_gain)
 }
 
 int
+rkisp_get_expo_weights(const struct rkisp_api_ctx *ctx,
+                       unsigned char* weights, unsigned int size)
+{
+    struct rkisp_priv *priv = (struct rkisp_priv *) ctx;
+
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
+        return -EINVAL;
+
+    if (size != RKISP_EXPO_WEIGHT_GRID) {
+        ERR("The weights array size shall be %d at least, but got %d\n",
+            RKISP_EXPO_WEIGHT_GRID, size);
+        return -EINVAL;
+    }
+
+    //TODO: warning if streamoff
+    //AEC weights are available after rkisp_cl_prepare(),
+    //for our case, after rkisp_open_device().
+    rkisp_get_aec_weights(weights, &size);
+
+    return 0;
+}
+
+int
 rkisp_set_expo_weights(const struct rkisp_api_ctx *ctx,
                        unsigned char* weights, unsigned int size)
 {
     struct rkisp_priv *priv = (struct rkisp_priv *) ctx;
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
+
+    if (size != RKISP_EXPO_WEIGHT_GRID) {
+        ERR("The weights array size should be %d\n", RKISP_EXPO_WEIGHT_GRID);
+        return -EINVAL;
+    }
 
     //TODO: warning if streamoff
     rkisp_set_aec_weights(weights, size);
@@ -1201,7 +1551,7 @@ rkisp_set_fps_range(const struct rkisp_api_ctx *ctx, int max_fps)
     struct control_params_3A* ctl_params;
     int32_t fps_range[2] = {1, 120};
 
-    if (!priv->ctx.uselocal3A || !priv->rkisp_engine || priv->is_rkcif)
+    if (!priv->ctx.uselocal3A || !priv->rkisp_engine)
         return -EINVAL;
 
     ctl_params = priv->g_3A_control_params;

@@ -29,17 +29,27 @@ struct rkisp_api_ctx {
     int uselocal3A;
 };
 
+#define RKISP_EXPO_WEIGHT_GRID      81
+#define RKISP_MAX_LUMINANCE_GRID	81
+#define RKISP_MAX_HISTOGRAM_BIN		64
+
 /*
  * The linked buffer held frame data.
  * For particular formats(e.g. YUV422M), every frame may contains multi planes.
  *
- * @buf:        The buffer pointer if exist
- * @fd:         The fd of buffer
- * @size:       The size of this buffer/plane
- * @expo_time:  the expo time in nano second of this frame when @uselocal3A is true
- * @gain:       The gain of this frame when @uselocal3A is true
- * @frame_id:   The frame id from librkisp.so
- * @next_plane: Link to the next plane if this is multi-planes buffer
+ * @buf:            The buffer pointer if exist
+ * @fd:             The fd of buffer
+ * @size:           The size of this buffer/plane
+ * @frame_id:       The frame id from librkisp.so
+ * @next_plane:     Link to the next plane if this is multi-planes buffer
+ *
+ * If @uselocal3A is true, some more data as below available:
+ *   @expo_time:            The expo time in nano second of this frame
+ *   @gain:                 The gain of this frame
+ *   @luminance_grid:       The luminance of 9x9(or 5x5) grid of this frame
+ *   @luminance_grid_count: The array size of @luminance_grid
+ *   @hist_bins:            The histogram array of this frame
+ *   @hist_bins_count:      The array size of @hist_bins
  */
 struct rkisp_api_buf {
     void *buf;
@@ -48,6 +58,10 @@ struct rkisp_api_buf {
     struct {
         int64_t expo_time;
         int gain;
+	unsigned char luminance_grid[RKISP_MAX_LUMINANCE_GRID];
+	int luminance_grid_count;
+	int hist_bins[RKISP_MAX_HISTOGRAM_BIN];
+	int hist_bins_count;
         int64_t frame_id;
     } metadata;
     struct timeval timestamp;
@@ -66,9 +80,26 @@ struct rkisp_api_buf {
  *
  * If failed return NULL.
  */
+
 const struct rkisp_api_ctx*
 rkisp_open_device(const char *dev_path, int uselocal3A);
 
+/* Set crop of frames.  The crop operation is before scaling. Optional.
+ * This can be called only when stream off.
+ *
+ * For example, sensor output 1920x1080, set crop to 1728x1080, and set
+ * #{rkisp_set_fmt} to 1280x800, it will be:
+ * 1920x1080  crop --> 1728x1080 scale down --> 1280x800
+ *
+ * @x:  The left offset
+ * @y:  The top offset
+ * @w:  The target width
+ * @h:  The target height
+ *
+ * Return 0 if success.
+ */
+int rkisp_video_set_crop(const struct rkisp_priv *priv,
+                         int x, int y, int w, int h);
 /*
  * Set the frame format, incluing resolution and fourcc. Optional.
  * This can be called only when stream off.
@@ -87,6 +118,9 @@ rkisp_set_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int fcc);
  * Set sensor format, incluing resolution and MEDIA_BUS_FMT. Optional.
  * This can be called only when stream off.
  *
+ * If sensor switches to a smaller size, this routine will trigger pipeline
+ * setting to change isp subdev format size.
+ *
  * @mbus_code:   defined in linux/media-bus-format.h
  *
  * Return 0 if success, error num if format is not supported.
@@ -95,6 +129,25 @@ rkisp_set_fmt(const struct rkisp_api_ctx *ctx, int w, int h, int fcc);
 int
 rkisp_set_sensor_fmt(const struct rkisp_api_ctx *ctx, int width, int height,
                      int mbus_code);
+
+/*
+ * Set the isp subdev fmt, including the sink and source pads. Optional.
+ * This can be called only when stream off.
+ *
+ * NOTE: This function is not commonly used.
+ *
+ * It is mainly used in when sensor output size is changed, or
+ * when app want capture bayer raw data (e.g. TOF sensor) which need change @out_code.
+ *
+ * @in_code:  the mbus code of sind pad
+ * @out_code: the mbus code of source pad
+ *
+ * mbus codes defined in linux/media-bus-format.h
+ */
+int
+rkisp_set_ispsd_fmt(const struct rkisp_api_ctx *ctx,
+                    int in_w, int in_h, int in_code,
+                    int out_w, int out_h, int out_code);
 /*
  * Request buffers bases on frame format. Optional.
  *
@@ -187,8 +240,21 @@ rkisp_set_max_gain(const struct rkisp_api_ctx *ctx, int max_gain);
 int
 rkisp_get_max_gain(const struct rkisp_api_ctx *ctx, int *max_gain);
 
+
+/*
+ * The get/set_expo_weights() will get or set exposure weights
+ * of RKISP_EXPO_WEIGHT_GRID(that is 9x9) grid.
+ *
+ * @weights:        The array of weight, size shall be at least 81(9x9).
+ * @size:           The size of array.
+ *
+ * Return 0 if success, or < 0 if error.
+ */
 int
 rkisp_set_expo_weights(const struct rkisp_api_ctx *ctx,
+                       unsigned char* weights, unsigned int size);
+int
+rkisp_get_expo_weights(const struct rkisp_api_ctx *ctx,
                        unsigned char* weights, unsigned int size);
 int
 rkisp_set_fps_range(const struct rkisp_api_ctx *ctx, int max_fps);
