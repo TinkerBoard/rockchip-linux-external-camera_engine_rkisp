@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2020, Rockchip Electronics Co., Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef __RKISP_API_CTX__
 #define __RKISP_API_CTX__
 
@@ -40,6 +56,7 @@ struct rkisp_api_ctx {
  * @buf:            The buffer pointer if exist
  * @fd:             The fd of buffer
  * @size:           The size of this buffer/plane
+ * @sequence:       The sequence count of this frame from v4l2_buffer
  * @frame_id:       The frame id from librkisp.so
  * @next_plane:     Link to the next plane if this is multi-planes buffer
  *
@@ -55,13 +72,14 @@ struct rkisp_api_buf {
     void *buf;
     int fd;
     int size;
+    uint64_t sequence;
     struct {
         int64_t expo_time;
         int gain;
-	unsigned char luminance_grid[RKISP_MAX_LUMINANCE_GRID];
-	int luminance_grid_count;
-	int hist_bins[RKISP_MAX_HISTOGRAM_BIN];
-	int hist_bins_count;
+    unsigned char luminance_grid[RKISP_MAX_LUMINANCE_GRID];
+    int luminance_grid_count;
+    int hist_bins[RKISP_MAX_HISTOGRAM_BIN];
+    int hist_bins_count;
         int64_t frame_id;
     } metadata;
     struct timeval timestamp;
@@ -225,6 +243,13 @@ rkisp_stop_capture(const struct rkisp_api_ctx *ctx);
  */
 void
 rkisp_close_device(const struct rkisp_api_ctx *ctx);
+
+
+/*
+ * Get the active sensor path.
+ */
+const char *
+rkisp_get_active_sensor(const struct rkisp_api_ctx *ctx);
 
 int
 rkisp_set_manual_expo(const struct rkisp_api_ctx *ctx, int on);
